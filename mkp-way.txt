@@ -1,0 +1,115 @@
+name: Generate Vanity Addresses
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    strategy:
+      matrix:
+        # 5 parallel virtual machines
+        worker: [1 ]
+      fail-fast: false
+    
+    runs-on: ubuntu-latest
+    timeout-minutes: 315
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 
+
+      - name: Install Dependencies
+        run: sudo apt-get update && sudo apt-get install -y gcc libc6-dev libsodium-dev make autoconf wget
+
+      - name: Build mkp224o
+        run: |
+          git clone https://github.com/cathugger/mkp224o.git
+          cd mkp224o && ./autogen.sh && ./configure && make
+
+
+# "https://raw.githubusercontent.com/danielmiessler/SecLists/refs/heads/master/Discovery/Web-Content/raft-large-words.txt"
+#              "https://raw.githubusercontent.com/danielmiessler/SecLists/refs/heads/master/Discovery/Web-Content/combined_words.txt"
+#https://raw.githubusercontent.com/danielmiessler/SecLists/refs/heads/master/Discovery/Web-Content/DirBuster-2007_directory-list-lowercase-2.3-big.txt
+
+#             "https://raw.githubusercontent.com/danielmiessler/SecLists/refs/heads/master/Discovery/Web-Content/raft-large-directories.txt"
+#
+#         "https://raw.githubusercontent.com/kkrypt0nn/wordlists/refs/heads/main/wordlists/miscellaneous/english_profanity_words.txt"
+
+      - name: Download and Prepare Wordlist
+        run: |
+          URLS=("https://raw.githubusercontent.com/heccdope/dpkm32s/refs/heads/main/xxx.txt")
+          
+          for url in "${URLS[@]}"; do
+            wget -qO- "$url" >> raw_combined.txt
+          done
+
+          # Filter: Base32 (a-z, 2-7), length >= 3, unique sort
+          cat raw_combined.txt | tr '[:upper:]' '[:lower:]' | tr -d '\r' | \
+          sed 's/[^a-z2-7]//g' | awk 'length($0) >= 5' | sort -u > words.txt
+          
+          echo "Database ready. Total patterns loaded: $(wc -l < words.txt)"
+          rm raw_combined.txt
+
+      - name: Execution and Sync
+        run: |
+          # 1. Setup Identity
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global pull.rebase true
+          
+          # 2. Setup isolated folder and gitignores
+          TARGET_DIR="short_3letter_"+"hits_w${{ matrix.worker }}_$(date +%s)"
+          mkdir -p "$TARGET_DIR"
+          
+          echo "mkp224o/" > .gitignore
+          echo "words.txt" >> .gitignore
+          echo "raw_combined.txt" >> .gitignore
+          
+          # 3. Force initial commit of .gitignore to lock the environment state
+          git add .gitignore
+          git commit -m "Worker ${{ matrix.worker }} initialized workspace" || echo "Workspace clean"
+          
+          # 4. Start Generator with unique seed
+          ./mkp224o/mkp224o -f words.txt -d "$TARGET_DIR" -s "seed_${{ matrix.worker }}_$(date +%s)" > /dev/null 2>&1 &
+          MKP_PID=$!
+          
+          # 5. 5-hour loop (60 cycles * 5 minutes/300 seconds)
+          for i in {1..60}; do
+            sleep 300
+            
+            # Break if generator crashes or completes early
+            if ! kill -0 $MKP_PID 2>/dev/null; then 
+              echo "Generator process exited."
+              break
+            fi
+            
+            # Stage everything in the current directory
+            chmod -R 777 "$TARGET_DIR" 2>/dev/null || true
+            git add .
+            
+            # Check if there are actually files staged to commit
+            if ! git diff-index --quiet HEAD; then
+              git commit -m "Worker ${{ matrix.worker }} push - Cycle $i"
+              
+              # Robust Rebase/Push Loop
+              for retry in {1..10}; do
+                if git pull --rebase origin ${{ github.ref_name }}; then
+                  if git push origin HEAD; then
+                    echo "Sync successful."
+                    break
+                  fi
+                fi
+                echo "Collision detected. Retrying $retry/10..."
+                sleep $(( (RANDOM % 15) + 5 ))
+              done
+            else
+              echo "No new hits this 5-minute cycle."
+            fi
+          done
+          
+          kill $MKP_PID || true
